@@ -1,0 +1,14 @@
+{
+	"name": "@queue/agent",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "$HOME/.bun/bin/bun run index.ts",
+		"start": "$HOME/.bun/bin/bun run index.ts",
+		"test": "$HOME/.bun/bin/bun test"
+	},
+	"dependencies": {
+		"@queue/core": "workspace:*"
+	}
+}

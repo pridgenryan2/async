@@ -1,0 +1,20 @@
+{
+	"name": "@queue/core",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts",
+		"./pi": "./src/pi.ts",
+		"./session": "./src/session.ts"
+	},
+	"types": "./src/index.ts",
+	"scripts": {
+		"test": "$HOME/.bun/bin/bun test"
+	},
+	"dependencies": {
+		"@noble/ciphers": "^2.1.1",
+		"@noble/curves": "^2.0.1",
+		"@noble/hashes": "^2.0.1"
+	}
+}
