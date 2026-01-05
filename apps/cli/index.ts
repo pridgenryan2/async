@@ -1,9 +1,9 @@
 ﻿import { consola } from "consola";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import type { IPty } from "node-pty";
 import {
 	buildSessionAad,
 	computeTranscriptHash,
@@ -30,8 +30,6 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 46321;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
-
-const MAX_PROMPT_LENGTH = 4000;
 
 type WireHello = {
 	type: "hello";
@@ -146,13 +144,6 @@ function isPayload(value: unknown): value is Payload {
 	return false;
 }
 
-function safePrompt(value: string): string {
-	if (value.length <= MAX_PROMPT_LENGTH) {
-		return value;
-	}
-	return `${value.slice(0, MAX_PROMPT_LENGTH)}...`;
-}
-
 function debugLog(enabled: boolean, message: string, data?: Record<string, unknown>) {
 	if (!enabled) {
 		return;
@@ -166,8 +157,8 @@ function debugLog(enabled: boolean, message: string, data?: Record<string, unkno
 
 async function runServer(host: string, port: number, debug: boolean): Promise<void> {
 	let session: SessionState | null = null;
-	const queue: string[] = [];
-	let running = false;
+	let ptyProcess: IPty | null = null;
+	const pendingInput: string[] = [];
 
 	const socket = await Bun.udpSocket({
 		port,
@@ -180,51 +171,7 @@ async function runServer(host: string, port: number, debug: boolean): Promise<vo
 				}
 
 				if (message.type === "hello") {
-					if (session && (session.peer.address !== remoteAddress || session.peer.port !== remotePort)) {
-						debugLog(debug, "Rejecting hello from unexpected peer.", {
-							remoteAddress,
-							remotePort,
-						});
-						return;
-					}
-
-					const helloResult = verifyHello(message.hello);
-					if (!helloResult.ok) {
-						debugLog(debug, "Hello verification failed.");
-						return;
-					}
-
-					const responderSign = createSigningKeyPair();
-					const responderDh = createDhKeyPair();
-					const reply = createReply(message.hello, responderSign, responderDh);
-					const sharedSecret = deriveSharedSecret(responderDh.privateKey, helloResult.dhPub);
-					const transcriptHash = computeTranscriptHash(message.hello, reply);
-					const keys = deriveSessionKeys(sharedSecret, transcriptHash, "responder");
-					const aad = buildSessionAad(message.hello.sessionId);
-
-					session = {
-						sessionId: message.hello.sessionId,
-						peer: { address: remoteAddress, port: remotePort },
-						keys,
-						sendIndex: 0,
-						recvIndex: 0,
-						aad,
-					};
-
-					socket.send(
-						encodeMessage({ type: "reply", reply }),
-						remotePort,
-						remoteAddress,
-					);
-					debugLog(debug, "Reply sent.", {
-						sessionId: session.sessionId,
-						peer: `${remoteAddress}:${remotePort}`,
-						signPub: toBase64Url(responderSign.publicKey),
-						dhPub: toBase64Url(responderDh.publicKey),
-						transcript: toBase64Url(transcriptHash),
-					});
-
-					sendEncrypted(session, { kind: "ready" });
+					void handleHello(message.hello, remotePort, remoteAddress);
 					return;
 				}
 
@@ -238,20 +185,71 @@ async function runServer(host: string, port: number, debug: boolean): Promise<vo
 						return;
 					}
 					if (payload.kind === "input") {
-						enqueueInput(payload.data);
+						if (ptyProcess) {
+							ptyProcess.write(payload.data);
+						} else {
+							pendingInput.push(payload.data);
+						}
 						return;
 					}
 					if (payload.kind === "exit") {
-						debugLog(debug, "Client exit requested.", { reason: payload.reason ?? "unknown" });
-						queue.length = 0;
-						running = false;
-						session = null;
-						return;
+						debugLog(debug, "Client exit requested.", {
+							reason: payload.reason ?? "unknown",
+						});
+						closeSession(payload.reason ?? "client_exit");
 					}
 				}
 			},
 		},
 	});
+
+	async function handleHello(hello: Hello, remotePort: number, remoteAddress: string) {
+		if (session && (session.peer.address !== remoteAddress || session.peer.port !== remotePort)) {
+			debugLog(debug, "Rejecting hello from unexpected peer.", {
+				remoteAddress,
+				remotePort,
+			});
+			return;
+		}
+
+		const helloResult = verifyHello(hello);
+		if (!helloResult.ok) {
+			debugLog(debug, "Hello verification failed.");
+			return;
+		}
+
+		const responderSign = createSigningKeyPair();
+		const responderDh = createDhKeyPair();
+		const reply = createReply(hello, responderSign, responderDh);
+		const sharedSecret = deriveSharedSecret(responderDh.privateKey, helloResult.dhPub);
+		const transcriptHash = computeTranscriptHash(hello, reply);
+		const keys = deriveSessionKeys(sharedSecret, transcriptHash, "responder");
+		const aad = buildSessionAad(hello.sessionId);
+
+		session = {
+			sessionId: hello.sessionId,
+			peer: { address: remoteAddress, port: remotePort },
+			keys,
+			sendIndex: 0,
+			recvIndex: 0,
+			aad,
+		};
+
+		socket.send(encodeMessage({ type: "reply", reply }), remotePort, remoteAddress);
+		debugLog(debug, "Reply sent.", {
+			sessionId: session.sessionId,
+			peer: `${remoteAddress}:${remotePort}`,
+			signPub: toBase64Url(responderSign.publicKey),
+			dhPub: toBase64Url(responderDh.publicKey),
+			transcript: toBase64Url(transcriptHash),
+		});
+
+		const started = await startSession();
+		if (started && session) {
+			sendEncrypted(session, { kind: "ready" });
+			flushPending();
+		}
+	}
 
 	function sendEncrypted(active: SessionState, payload: Payload) {
 		const envelope = encryptPayload(
@@ -300,74 +298,89 @@ async function runServer(host: string, port: number, debug: boolean): Promise<vo
 		}
 	}
 
-	function enqueueInput(input: string) {
-		queue.push(input);
-		void runNext();
+	async function startSession(): Promise<boolean> {
+		if (!session || ptyProcess) {
+			return true;
+		}
+		try {
+			const { spawn } = await import("node-pty");
+			const bunx = resolveBunx();
+			const args = ["@openai/codex@latest", "--sandbox", "danger-full-access"];
+			debugLog(debug, "Launching interactive codex.", { bunx });
+			ptyProcess = spawn(bunx, args, {
+				name: "xterm-color",
+				cols: 120,
+				rows: 30,
+				cwd: process.cwd(),
+				env: {
+					...process.env,
+					TERM: "xterm-256color",
+					COLORTERM: "truecolor",
+				},
+			});
+
+			ptyProcess.onData((data) => {
+				if (!session) {
+					return;
+				}
+				sendEncrypted(session, { kind: "output", stream: "stdout", data });
+			});
+
+			ptyProcess.onExit(({ exitCode, signal }) => {
+				if (!session) {
+					return;
+				}
+				const reason = `exit:${exitCode ?? "unknown"}:${signal ?? ""}`;
+				sendEncrypted(session, { kind: "exit", reason });
+				ptyProcess = null;
+				session = null;
+				pendingInput.length = 0;
+			});
+
+			return true;
+		} catch (err) {
+			if (session) {
+				sendEncrypted(session, {
+					kind: "error",
+					message: err instanceof Error ? err.message : String(err),
+				});
+			}
+			return false;
+		}
 	}
 
-	function runNext() {
-		if (!session || running || queue.length === 0) {
+	function flushPending() {
+		if (!ptyProcess) {
 			return;
 		}
-		const next = queue.shift() ?? "";
-		const prompt = safePrompt(next.replace(/\r?\n$/, ""));
-		if (!prompt.trim()) {
-			sendEncrypted(session, { kind: "complete" });
-			void runNext();
+		while (pendingInput.length > 0) {
+			const value = pendingInput.shift();
+			if (value) {
+				ptyProcess.write(value);
+			}
+		}
+	}
+
+	function closeSession(reason: string) {
+		if (!session) {
 			return;
 		}
-
-		const bunx = resolveBunx();
-		const args = [
-			"@openai/codex@latest",
-			"exec",
-			"--sandbox",
-			"danger-full-access",
-			"--color",
-			"never",
-			prompt,
-		];
-
-		debugLog(debug, "Launching codex exec.", { prompt });
-		running = true;
-		const child = spawn(bunx, args, {
-			stdio: ["ignore", "pipe", "pipe"],
-			shell: process.platform === "win32",
-			env: { ...process.env },
-		});
-
-		child.stdout?.on("data", (chunk: Buffer) => {
-			if (!session) {
-				return;
-			}
-			sendEncrypted(session, { kind: "output", stream: "stdout", data: chunk.toString("utf8") });
-		});
-		child.stderr?.on("data", (chunk: Buffer) => {
-			if (!session) {
-				return;
-			}
-			sendEncrypted(session, { kind: "output", stream: "stderr", data: chunk.toString("utf8") });
-		});
-		child.on("exit", () => {
-			running = false;
-			if (session) {
-				sendEncrypted(session, { kind: "complete" });
-			}
-			void runNext();
-		});
-		child.on("error", (err) => {
-			running = false;
-			if (session) {
-				sendEncrypted(session, { kind: "error", message: err.message });
-			}
-			void runNext();
-		});
+		const active = session;
+		if (ptyProcess) {
+			ptyProcess.kill();
+			ptyProcess = null;
+		}
+		session = null;
+		pendingInput.length = 0;
+		sendEncrypted(active, { kind: "exit", reason });
 	}
 
 	consola.ready(`UDP server listening on ${host}:${socket.port}.`);
 	process.on("SIGINT", () => {
 		consola.info("Shutting down server.");
-		queue.length = 0;
+		if (ptyProcess) {
+			ptyProcess.kill();
+		}
 		socket.close();
 		process.exit(0);
 	});
@@ -379,6 +392,8 @@ async function runClient(host: string, port: number, debug: boolean): Promise<vo
 	const initiatorDh = createDhKeyPair();
 	let session: SessionState | null = null;
 	const pending: string[] = [];
+
+	const hello = createHello(sessionId, initiatorSign, initiatorDh);
 
 	const socket = await Bun.udpSocket({
 		port: 0,
@@ -434,7 +449,6 @@ async function runClient(host: string, port: number, debug: boolean): Promise<vo
 		},
 	});
 
-	const hello = createHello(sessionId, initiatorSign, initiatorDh);
 	socket.send(encodeMessage({ type: "hello", hello }), port, host);
 
 	const rl = readline.createInterface({
