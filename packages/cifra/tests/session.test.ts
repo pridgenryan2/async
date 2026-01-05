@@ -1,82 +1,70 @@
-import { expect, test } from "bun:test";
+﻿import { expect, test } from "bun:test";
 import {
 	buildSessionAad,
 	computeTranscriptHash,
-	createClientHello,
 	createDhKeyPair,
-	createServerHello,
+	createHello,
+	createReply,
 	createSigningKeyPair,
 	decodeJson,
+	decryptPayload,
 	deriveSessionKeys,
 	deriveSharedSecret,
+	encodeJson,
 	encryptPayload,
 	toBase64Url,
-	verifyClientHello,
-	verifyServerHello,
-	decryptPayload,
-	encodeJson,
+	verifyHello,
+	verifyReply,
 } from "../src/session";
 
 test("handshake derives matching session keys", () => {
 	const sessionId = "session-1";
-	const clientSign = createSigningKeyPair();
-	const clientDh = createDhKeyPair();
-	const serverSign = createSigningKeyPair();
-	const serverDh = createDhKeyPair();
+	const initiatorSign = createSigningKeyPair();
+	const initiatorDh = createDhKeyPair();
+	const responderSign = createSigningKeyPair();
+	const responderDh = createDhKeyPair();
 
-	const clientHello = createClientHello(sessionId, clientSign, clientDh);
-	const clientCheck = verifyClientHello(clientHello);
-	expect(clientCheck.ok).toBe(true);
+	const hello = createHello(sessionId, initiatorSign, initiatorDh);
+	const helloCheck = verifyHello(hello);
+	expect(helloCheck.ok).toBe(true);
 
-	const serverHello = createServerHello(clientHello, serverSign, serverDh);
-	const serverCheck = verifyServerHello(clientHello, serverHello);
-	expect(serverCheck.ok).toBe(true);
+	const reply = createReply(hello, responderSign, responderDh);
+	const replyCheck = verifyReply(hello, reply);
+	expect(replyCheck.ok).toBe(true);
 
-	const transcriptHash = computeTranscriptHash(clientHello, serverHello);
-	const clientShared = deriveSharedSecret(clientDh.privateKey, serverCheck.serverDhPub);
-	const serverShared = deriveSharedSecret(serverDh.privateKey, clientCheck.clientDhPub);
+	const transcriptHash = computeTranscriptHash(hello, reply);
+	const initiatorShared = deriveSharedSecret(initiatorDh.privateKey, replyCheck.dhPub);
+	const responderShared = deriveSharedSecret(responderDh.privateKey, helloCheck.dhPub);
 
-	const clientKeys = deriveSessionKeys(clientShared, transcriptHash);
-	const serverKeys = deriveSessionKeys(serverShared, transcriptHash);
+	const initiatorKeys = deriveSessionKeys(initiatorShared, transcriptHash, "initiator");
+	const responderKeys = deriveSessionKeys(responderShared, transcriptHash, "responder");
 
-	expect(Array.from(clientKeys.clientToServerKey)).toEqual(
-		Array.from(serverKeys.clientToServerKey),
-	);
-	expect(Array.from(clientKeys.serverToClientKey)).toEqual(
-		Array.from(serverKeys.serverToClientKey),
-	);
+	expect(Array.from(initiatorKeys.sendKey)).toEqual(Array.from(responderKeys.recvKey));
+	expect(Array.from(initiatorKeys.recvKey)).toEqual(Array.from(responderKeys.sendKey));
 });
 
-test("client payload encrypts and decrypts with derived key", () => {
+test("payload encrypts and decrypts with derived key", () => {
 	const sessionId = "session-2";
-	const clientSign = createSigningKeyPair();
-	const clientDh = createDhKeyPair();
-	const serverSign = createSigningKeyPair();
-	const serverDh = createDhKeyPair();
+	const initiatorSign = createSigningKeyPair();
+	const initiatorDh = createDhKeyPair();
+	const responderSign = createSigningKeyPair();
+	const responderDh = createDhKeyPair();
 
-	const clientHello = createClientHello(sessionId, clientSign, clientDh);
-	const serverHello = createServerHello(clientHello, serverSign, serverDh);
-	const transcriptHash = computeTranscriptHash(clientHello, serverHello);
+	const hello = createHello(sessionId, initiatorSign, initiatorDh);
+	const reply = createReply(hello, responderSign, responderDh);
+	const transcriptHash = computeTranscriptHash(hello, reply);
 
-	const clientShared = deriveSharedSecret(clientDh.privateKey, serverDh.publicKey);
-	const serverShared = deriveSharedSecret(serverDh.privateKey, clientDh.publicKey);
-	const clientKeys = deriveSessionKeys(clientShared, transcriptHash);
-	const serverKeys = deriveSessionKeys(serverShared, transcriptHash);
+	const initiatorShared = deriveSharedSecret(initiatorDh.privateKey, responderDh.publicKey);
+	const responderShared = deriveSharedSecret(responderDh.privateKey, initiatorDh.publicKey);
+	const initiatorKeys = deriveSessionKeys(initiatorShared, transcriptHash, "initiator");
+	const responderKeys = deriveSessionKeys(responderShared, transcriptHash, "responder");
 
 	const payload = encodeJson({ piIndex: 42 });
 	const aad = buildSessionAad(sessionId);
-	const envelope = encryptPayload(
-		clientKeys.clientToServerKey,
-		transcriptHash,
-		"c2s",
-		0,
-		payload,
-		aad,
-	);
+	const envelope = encryptPayload(initiatorKeys.sendKey, initiatorKeys.transcriptHash, 0, payload, aad);
 	const decrypted = decryptPayload(
-		serverKeys.clientToServerKey,
-		transcriptHash,
-		"c2s",
+		responderKeys.recvKey,
+		responderKeys.transcriptHash,
 		envelope.index,
 		envelope.ciphertext,
 		aad,
@@ -85,9 +73,8 @@ test("client payload encrypts and decrypts with derived key", () => {
 
 	expect(() =>
 		decryptPayload(
-			serverKeys.clientToServerKey,
-			transcriptHash,
-			"c2s",
+			responderKeys.recvKey,
+			responderKeys.transcriptHash,
 			envelope.index,
 			envelope.ciphertext,
 			buildSessionAad("wrong-session"),
@@ -95,36 +82,36 @@ test("client payload encrypts and decrypts with derived key", () => {
 	).toThrow();
 });
 
-test("tampered client hello fails signature validation", () => {
+test("tampered hello fails signature validation", () => {
 	const sessionId = "session-3";
-	const clientSign = createSigningKeyPair();
-	const clientDh = createDhKeyPair();
-	const clientHello = createClientHello(sessionId, clientSign, clientDh);
+	const initiatorSign = createSigningKeyPair();
+	const initiatorDh = createDhKeyPair();
+	const hello = createHello(sessionId, initiatorSign, initiatorDh);
 
-	const tampered = { ...clientHello, sessionId: "session-3-tamper" };
-	const result = verifyClientHello(tampered);
+	const tampered = { ...hello, sessionId: "session-3-tamper" };
+	const result = verifyHello(tampered);
 	expect(result.ok).toBe(false);
 });
 
 test("handshake payloads do not expose private keys", () => {
 	const sessionId = "session-4";
-	const clientSignPriv = new Uint8Array(32).fill(1);
-	const clientDhPriv = new Uint8Array(32).fill(2);
-	const serverSignPriv = new Uint8Array(32).fill(3);
-	const serverDhPriv = new Uint8Array(32).fill(4);
-	const clientSign = createSigningKeyPair(clientSignPriv);
-	const clientDh = createDhKeyPair(clientDhPriv);
-	const serverSign = createSigningKeyPair(serverSignPriv);
-	const serverDh = createDhKeyPair(serverDhPriv);
+	const initiatorSignPriv = new Uint8Array(32).fill(1);
+	const initiatorDhPriv = new Uint8Array(32).fill(2);
+	const responderSignPriv = new Uint8Array(32).fill(3);
+	const responderDhPriv = new Uint8Array(32).fill(4);
+	const initiatorSign = createSigningKeyPair(initiatorSignPriv);
+	const initiatorDh = createDhKeyPair(initiatorDhPriv);
+	const responderSign = createSigningKeyPair(responderSignPriv);
+	const responderDh = createDhKeyPair(responderDhPriv);
 
-	const clientHello = createClientHello(sessionId, clientSign, clientDh);
-	const serverHello = createServerHello(clientHello, serverSign, serverDh);
+	const hello = createHello(sessionId, initiatorSign, initiatorDh);
+	const reply = createReply(hello, responderSign, responderDh);
 
-	const clientPayload = JSON.stringify(clientHello);
-	const serverPayload = JSON.stringify(serverHello);
+	const helloPayload = JSON.stringify(hello);
+	const replyPayload = JSON.stringify(reply);
 
-	expect(clientPayload.includes(toBase64Url(clientSignPriv))).toBe(false);
-	expect(clientPayload.includes(toBase64Url(clientDhPriv))).toBe(false);
-	expect(serverPayload.includes(toBase64Url(serverSignPriv))).toBe(false);
-	expect(serverPayload.includes(toBase64Url(serverDhPriv))).toBe(false);
+	expect(helloPayload.includes(toBase64Url(initiatorSignPriv))).toBe(false);
+	expect(helloPayload.includes(toBase64Url(initiatorDhPriv))).toBe(false);
+	expect(replyPayload.includes(toBase64Url(responderSignPriv))).toBe(false);
+	expect(replyPayload.includes(toBase64Url(responderDhPriv))).toBe(false);
 });
