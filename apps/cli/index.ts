@@ -2,7 +2,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import readline from "node:readline";
 import type { IPty } from "node-pty";
 import {
 	buildSessionAad,
@@ -451,32 +450,32 @@ async function runClient(host: string, port: number, debug: boolean): Promise<vo
 
 	socket.send(encodeMessage({ type: "hello", hello }), port, host);
 
-	const rl = readline.createInterface({
-		input: process.stdin,
-		output: process.stdout,
-		terminal: true,
-	});
-
-	rl.on("line", (line) => {
-		const value = `${line}\n`;
-		if (!session) {
-			pending.push(value);
-			return;
-		}
-		sendEncrypted(session, { kind: "input", data: value });
-	});
-
 	process.on("SIGINT", () => {
 		consola.info("Closing session.");
 		if (session) {
 			sendEncrypted(session, { kind: "exit", reason: "client_exit" });
 		}
 		socket.close();
-		rl.close();
 		process.exit(0);
 	});
 
 	consola.ready(`Connected to ${host}:${port}. Waiting for handshake...`);
+	if (process.stdin.isTTY) {
+		process.stdin.setRawMode(true);
+	}
+	process.stdin.resume();
+	process.stdin.on("data", (chunk: Buffer) => {
+		if (chunk.length === 1 && chunk[0] === 3) {
+			process.emit("SIGINT");
+			return;
+		}
+		const value = chunk.toString("utf8");
+		if (!session) {
+			pending.push(value);
+			return;
+		}
+		sendEncrypted(session, { kind: "input", data: value });
+	});
 
 	function sendEncrypted(active: SessionState, payload: Payload) {
 		const envelope = encryptPayload(
