@@ -8,6 +8,7 @@
 		"start": "$HOME/.bun/bin/bun run index.ts"
 	},
 	"dependencies": {
-		"consola": "^3.2.3"
+		"consola": "^3.2.3",
+		"@siguiente/cifra": "workspace:*"
 	}
 }
