@@ -32,6 +32,10 @@ type OutputMessage = {
 	data: string;
 };
 
+type CompleteMessage = {
+	type: "complete";
+};
+
 type ExitMessage = {
 	type: "exit";
 	code?: number | null;
@@ -44,7 +48,14 @@ type ErrorMessage = {
 	message: string;
 };
 
-type Message = HelloMessage | ReadyMessage | InputMessage | OutputMessage | ExitMessage | ErrorMessage;
+type Message =
+	| HelloMessage
+	| ReadyMessage
+	| InputMessage
+	| OutputMessage
+	| CompleteMessage
+	| ExitMessage
+	| ErrorMessage;
 
 type RemotePeer = {
 	address: string;
@@ -101,7 +112,8 @@ function describePeer(peer: RemotePeer) {
 
 async function runServer(host: string, port: number): Promise<void> {
 	let peer: RemotePeer | null = null;
-	let child: ReturnType<typeof spawn> | null = null;
+	const queue: string[] = [];
+	let running = false;
 
 	const socket = await Bun.udpSocket({
 		port,
@@ -119,7 +131,6 @@ async function runServer(host: string, port: number): Promise<void> {
 					}
 					peer = { address: remoteAddress, port: remotePort, sessionId: message.sessionId };
 					consola.info(`Client connected from ${describePeer(peer)}.`);
-					startSession();
 					send({ type: "ready", sessionId: message.sessionId });
 					return;
 				}
@@ -129,15 +140,15 @@ async function runServer(host: string, port: number): Promise<void> {
 				}
 
 				if (message.type === "input") {
-					if (child?.stdin) {
-						child.stdin.write(message.data);
-					}
+					enqueueInput(message.data);
 					return;
 				}
 
 				if (message.type === "exit") {
 					consola.info(`Client requested exit: ${message.reason ?? "session_end"}`);
-					stopSession();
+					queue.length = 0;
+					running = false;
+					peer = null;
 				}
 			},
 		},
@@ -150,15 +161,38 @@ async function runServer(host: string, port: number): Promise<void> {
 		socket.send(encodeMessage(message), peer.port, peer.address);
 	}
 
-	function startSession() {
-		if (child) {
+	function enqueueInput(data: string) {
+		queue.push(data);
+		void runNext();
+	}
+
+	function runNext() {
+		if (running || queue.length === 0) {
 			return;
 		}
+		const next = queue.shift() ?? "";
+		const prompt = next.replace(/\r?\n$/, "");
+		if (!prompt.trim()) {
+			send({ type: "complete" });
+			void runNext();
+			return;
+		}
+
 		const bunx = resolveBunx();
-		const args = ["@openai/codex@latest", "--sandbox", "danger-full-access"];
-		consola.start(`Launching ${bunx} ${args.join(" ")}`);
-		child = spawn(bunx, args, {
-			stdio: "pipe",
+		const args = [
+			"@openai/codex@latest",
+			"exec",
+			"--sandbox",
+			"danger-full-access",
+			"--color",
+			"never",
+			prompt,
+		];
+
+		consola.start(`Executing: ${prompt.slice(0, 120)}`);
+		running = true;
+		const child = spawn(bunx, args, {
+			stdio: ["ignore", "pipe", "pipe"],
 			shell: process.platform === "win32",
 			env: { ...process.env },
 		});
@@ -169,27 +203,22 @@ async function runServer(host: string, port: number): Promise<void> {
 		child.stderr?.on("data", (chunk: Buffer) => {
 			send({ type: "output", stream: "stderr", data: chunk.toString("utf8") });
 		});
-		child.on("exit", (code, signal) => {
-			send({ type: "exit", code, signal });
-			child = null;
+		child.on("exit", () => {
+			running = false;
+			send({ type: "complete" });
+			void runNext();
 		});
 		child.on("error", (err) => {
+			running = false;
 			send({ type: "error", message: err.message });
+			void runNext();
 		});
-	}
-
-	function stopSession() {
-		if (!child) {
-			return;
-		}
-		child.kill();
-		child = null;
 	}
 
 	consola.ready(`UDP server listening on ${host}:${socket.port}.`);
 	process.on("SIGINT", () => {
 		consola.info("Shutting down server.");
-		stopSession();
+		queue.length = 0;
 		socket.close();
 		process.exit(0);
 	});
@@ -216,6 +245,9 @@ async function runClient(host: string, port: number): Promise<void> {
 						} else {
 							process.stdout.write(message.data);
 						}
+						break;
+					case "complete":
+						consola.info("Remote command complete.");
 						break;
 					case "error":
 						consola.error(message.message);
