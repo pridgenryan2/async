@@ -10,6 +10,7 @@ import {
 	deriveSessionKeys,
 	deriveSharedSecret,
 	encryptPayload,
+	toBase64Url,
 	verifyClientHello,
 	verifyServerHello,
 	decryptPayload,
@@ -103,4 +104,27 @@ test("tampered client hello fails signature validation", () => {
 	const tampered = { ...clientHello, sessionId: "session-3-tamper" };
 	const result = verifyClientHello(tampered);
 	expect(result.ok).toBe(false);
+});
+
+test("handshake payloads do not expose private keys", () => {
+	const sessionId = "session-4";
+	const clientSignPriv = new Uint8Array(32).fill(1);
+	const clientDhPriv = new Uint8Array(32).fill(2);
+	const serverSignPriv = new Uint8Array(32).fill(3);
+	const serverDhPriv = new Uint8Array(32).fill(4);
+	const clientSign = createSigningKeyPair(clientSignPriv);
+	const clientDh = createDhKeyPair(clientDhPriv);
+	const serverSign = createSigningKeyPair(serverSignPriv);
+	const serverDh = createDhKeyPair(serverDhPriv);
+
+	const clientHello = createClientHello(sessionId, clientSign, clientDh);
+	const serverHello = createServerHello(clientHello, serverSign, serverDh);
+
+	const clientPayload = JSON.stringify(clientHello);
+	const serverPayload = JSON.stringify(serverHello);
+
+	expect(clientPayload.includes(toBase64Url(clientSignPriv))).toBe(false);
+	expect(clientPayload.includes(toBase64Url(clientDhPriv))).toBe(false);
+	expect(serverPayload.includes(toBase64Url(serverSignPriv))).toBe(false);
+	expect(serverPayload.includes(toBase64Url(serverDhPriv))).toBe(false);
 });

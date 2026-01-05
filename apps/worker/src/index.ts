@@ -1,7 +1,6 @@
+import { computePiFractionDigits, computePiHashFromDigits } from "@queue/core";
 import {
 	buildSessionAad,
-	computePiFractionDigits,
-	computePiHashFromDigits,
 	computeTranscriptHash,
 	createDhKeyPair,
 	createServerHello,
@@ -17,7 +16,7 @@ import {
 	type ClientHello,
 	type SecureEnvelope,
 	type ServerHello,
-} from "@queue/core";
+} from "@siguiente/cifra";
 
 const SESSION_DO_NAME = "singleton";
 const STATE_KEY = "state";
