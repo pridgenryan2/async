@@ -8,17 +8,12 @@
 		"./session": "./src/session.ts"
 	},
 	"types": "./src/index.ts",
-		"scripts": {
-			"test": "$HOME/.bun/bin/bun test",
-			"e2e:http": "node ./node_modules/cypress/bin/cypress run --config-file e2e/http/cypress.config.ts",
-			"e2e:http:open": "node ./node_modules/cypress/bin/cypress open --config-file e2e/http/cypress.config.ts"
-		},
+	"scripts": {
+		"test": "$HOME/.bun/bin/bun test"
+	},
 	"dependencies": {
 		"@noble/ciphers": "^2.1.1",
 		"@noble/curves": "^2.0.1",
 		"@noble/hashes": "^2.0.1"
-	},
-	"devDependencies": {
-		"cypress": "^14.5.0"
 	}
 }
