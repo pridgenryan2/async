@@ -1,0 +1,15 @@
+﻿{
+	"name": "@queue/cli",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "bun index.ts",
+		"start": "$HOME/.bun/bin/bun run index.ts"
+	},
+	"dependencies": {
+		"consola": "^3.2.3",
+		"@siguiente/cifra": "workspace:*",
+		"node-pty": "^1.0.0"
+	}
+}

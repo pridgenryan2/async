@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-	transpilePackages: ["@queue/core"],
+	transpilePackages: ["@queue/core", "@siguiente/cifra"],
 };
 
 export default nextConfig;

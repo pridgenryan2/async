@@ -4,7 +4,7 @@ import { computePiHash, MAX_PI_INDEX } from "../lib/pi";
 import {
 	buildSessionAad,
 	computeTranscriptHash,
-	createClientHello,
+	createHello,
 	createDhKeyPair,
 	createSigningKeyPair,
 	decodeJson,
@@ -13,10 +13,10 @@ import {
 	deriveSharedSecret,
 	encodeJson,
 	encryptPayload,
-	verifyServerHello,
-	type ClientHello,
+	verifyReply,
+	type Hello,
+	type Reply,
 	type SecureEnvelope,
-	type ServerHello,
 } from "../lib/session";
 
 type ApiResult<T> = { ok: boolean; status: number; data: T | null };
@@ -92,34 +92,33 @@ export async function openSessionAction(input: { piIndex: string | number }): Pr
 	}
 
 	const sessionId = crypto.randomUUID();
-	const clientSign = createSigningKeyPair();
-	const clientDh = createDhKeyPair();
-	const clientHello: ClientHello = createClientHello(sessionId, clientSign, clientDh);
+	const initiatorSign = createSigningKeyPair();
+	const initiatorDh = createDhKeyPair();
+	const hello: Hello = createHello(sessionId, initiatorSign, initiatorDh);
 
-	const helloResult = await fetchJson<{ serverHello?: ServerHello; error?: string }>("/session/hello", {
+	const helloResult = await fetchJson<{ reply?: Reply; error?: string }>("/session/hello", {
 		method: "POST",
-		body: JSON.stringify(clientHello),
+		body: JSON.stringify(hello),
 	});
 
-	if (!helloResult.ok || !helloResult.data?.serverHello) {
+	if (!helloResult.ok || !helloResult.data?.reply) {
 		return { ok: false, error: helloResult.data?.error ?? "hello_failed" };
 	}
 
-	const serverHello = helloResult.data.serverHello;
-	const verify = verifyServerHello(clientHello, serverHello);
+	const reply = helloResult.data.reply;
+	const verify = verifyReply(hello, reply);
 	if (!verify.ok) {
-		return { ok: false, error: "invalid_server_signature" };
+		return { ok: false, error: "invalid_reply_signature" };
 	}
 
-	const sharedSecret = deriveSharedSecret(clientDh.privateKey, verify.serverDhPub);
-	const transcriptHash = computeTranscriptHash(clientHello, serverHello);
-	const keys = deriveSessionKeys(sharedSecret, transcriptHash);
+	const sharedSecret = deriveSharedSecret(initiatorDh.privateKey, verify.dhPub);
+	const transcriptHash = computeTranscriptHash(hello, reply);
+	const keys = deriveSessionKeys(sharedSecret, transcriptHash, "initiator");
 
 	const aad = buildSessionAad(sessionId);
 	const envelope: SecureEnvelope = encryptPayload(
-		keys.clientToServerKey,
+		keys.sendKey,
 		keys.transcriptHash,
-		"c2s",
 		0,
 		encodeJson({ piIndex: parsed }),
 		aad,
@@ -137,9 +136,8 @@ export async function openSessionAction(input: { piIndex: string | number }): Pr
 	let payload: unknown;
 	try {
 		const decrypted = decryptPayload(
-			keys.serverToClientKey,
+			keys.recvKey,
 			keys.transcriptHash,
-			"s2c",
 			openResult.data.envelope.index,
 			openResult.data.envelope.ciphertext,
 			aad,

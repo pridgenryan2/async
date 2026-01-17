@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@queue/core": "workspace:*",
+    "@siguiente/cifra": "workspace:*",
     "@opennextjs/cloudflare": "^1.14.4",
     "next": "15.5.9",
     "react": "19.1.4",

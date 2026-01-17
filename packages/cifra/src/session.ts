@@ -1,9 +1,9 @@
-import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
+﻿import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 
-const PROTOCOL_ID = "pi-queue-v1";
+const PROTOCOL_ID = "cifra-channel-v1";
 const TEXT_ENCODER = new TextEncoder();
 
 export type KeyPair = {
@@ -11,27 +11,27 @@ export type KeyPair = {
 	privateKey: Uint8Array;
 };
 
-export type ClientHello = {
+export type Hello = {
 	sessionId: string;
-	clientSignPub: string;
-	clientDhPub: string;
+	signPub: string;
+	dhPub: string;
 	signature: string;
 };
 
-export type ServerHello = {
+export type Reply = {
 	sessionId: string;
-	serverSignPub: string;
-	serverDhPub: string;
+	signPub: string;
+	dhPub: string;
 	signature: string;
 };
+
+export type Role = "initiator" | "responder";
 
 export type SessionKeys = {
-	clientToServerKey: Uint8Array;
-	serverToClientKey: Uint8Array;
+	sendKey: Uint8Array;
+	recvKey: Uint8Array;
 	transcriptHash: Uint8Array;
 };
-
-export type Direction = "c2s" | "s2c";
 
 export type SecureEnvelope = {
 	index: number;
@@ -65,146 +65,135 @@ export function verifySignature(message: Uint8Array, signature: Uint8Array, publ
 	return ed25519.verify(signature, message, publicKey);
 }
 
-export function createClientHello(
-	sessionId: string,
-	signingKey: KeyPair,
-	dhKey: KeyPair,
-): ClientHello {
-	const transcript = buildClientHelloTranscript(sessionId, signingKey.publicKey, dhKey.publicKey);
+export function createHello(sessionId: string, signingKey: KeyPair, dhKey: KeyPair): Hello {
+	const transcript = buildHelloTranscript(sessionId, signingKey.publicKey, dhKey.publicKey);
 	const signature = signBytes(transcript, signingKey.privateKey);
 	return {
 		sessionId,
-		clientSignPub: toBase64Url(signingKey.publicKey),
-		clientDhPub: toBase64Url(dhKey.publicKey),
+		signPub: toBase64Url(signingKey.publicKey),
+		dhPub: toBase64Url(dhKey.publicKey),
 		signature: toBase64Url(signature),
 	};
 }
 
-export function verifyClientHello(
-	hello: ClientHello,
-	expectedClientSignPub?: Uint8Array,
-): { ok: boolean; clientSignPub: Uint8Array; clientDhPub: Uint8Array; transcript: Uint8Array } {
-	const clientSignPub = fromBase64Url(hello.clientSignPub);
-	const clientDhPub = fromBase64Url(hello.clientDhPub);
+export function verifyHello(
+	hello: Hello,
+	expectedSignPub?: Uint8Array,
+): { ok: boolean; signPub: Uint8Array; dhPub: Uint8Array; transcript: Uint8Array } {
+	const signPub = fromBase64Url(hello.signPub);
+	const dhPub = fromBase64Url(hello.dhPub);
 	const signature = fromBase64Url(hello.signature);
-	const transcript = buildClientHelloTranscript(hello.sessionId, clientSignPub, clientDhPub);
+	const transcript = buildHelloTranscript(hello.sessionId, signPub, dhPub);
 
-	if (expectedClientSignPub && !bytesEqual(expectedClientSignPub, clientSignPub)) {
-		return { ok: false, clientSignPub, clientDhPub, transcript };
+	if (expectedSignPub && !bytesEqual(expectedSignPub, signPub)) {
+		return { ok: false, signPub, dhPub, transcript };
 	}
-	const ok = verifySignature(transcript, signature, clientSignPub);
-	return { ok, clientSignPub, clientDhPub, transcript };
+	const ok = verifySignature(transcript, signature, signPub);
+	return { ok, signPub, dhPub, transcript };
 }
 
-export function createServerHello(
-	clientHello: ClientHello,
-	signingKey: KeyPair,
-	dhKey: KeyPair,
-): ServerHello {
-	const clientSignPub = fromBase64Url(clientHello.clientSignPub);
-	const clientDhPub = fromBase64Url(clientHello.clientDhPub);
-	const transcript = buildServerHelloTranscript(
-		clientHello.sessionId,
-		clientSignPub,
-		clientDhPub,
+export function createReply(hello: Hello, signingKey: KeyPair, dhKey: KeyPair): Reply {
+	const helloSignPub = fromBase64Url(hello.signPub);
+	const helloDhPub = fromBase64Url(hello.dhPub);
+	const transcript = buildReplyTranscript(
+		hello.sessionId,
+		helloSignPub,
+		helloDhPub,
 		signingKey.publicKey,
 		dhKey.publicKey,
 	);
 	const signature = signBytes(transcript, signingKey.privateKey);
 	return {
-		sessionId: clientHello.sessionId,
-		serverSignPub: toBase64Url(signingKey.publicKey),
-		serverDhPub: toBase64Url(dhKey.publicKey),
+		sessionId: hello.sessionId,
+		signPub: toBase64Url(signingKey.publicKey),
+		dhPub: toBase64Url(dhKey.publicKey),
 		signature: toBase64Url(signature),
 	};
 }
 
-export function verifyServerHello(
-	clientHello: ClientHello,
-	serverHello: ServerHello,
-	expectedServerSignPub?: Uint8Array,
-): { ok: boolean; serverSignPub: Uint8Array; serverDhPub: Uint8Array; transcript: Uint8Array } {
-	if (clientHello.sessionId !== serverHello.sessionId) {
+export function verifyReply(
+	hello: Hello,
+	reply: Reply,
+	expectedSignPub?: Uint8Array,
+): { ok: boolean; signPub: Uint8Array; dhPub: Uint8Array; transcript: Uint8Array } {
+	if (hello.sessionId !== reply.sessionId) {
 		return {
 			ok: false,
-			serverSignPub: fromBase64Url(serverHello.serverSignPub),
-			serverDhPub: fromBase64Url(serverHello.serverDhPub),
+			signPub: fromBase64Url(reply.signPub),
+			dhPub: fromBase64Url(reply.dhPub),
 			transcript: new Uint8Array(),
 		};
 	}
-	const clientSignPub = fromBase64Url(clientHello.clientSignPub);
-	const clientDhPub = fromBase64Url(clientHello.clientDhPub);
-	const serverSignPub = fromBase64Url(serverHello.serverSignPub);
-	const serverDhPub = fromBase64Url(serverHello.serverDhPub);
-	const signature = fromBase64Url(serverHello.signature);
-	const transcript = buildServerHelloTranscript(
-		clientHello.sessionId,
-		clientSignPub,
-		clientDhPub,
-		serverSignPub,
-		serverDhPub,
+	const helloSignPub = fromBase64Url(hello.signPub);
+	const helloDhPub = fromBase64Url(hello.dhPub);
+	const replySignPub = fromBase64Url(reply.signPub);
+	const replyDhPub = fromBase64Url(reply.dhPub);
+	const signature = fromBase64Url(reply.signature);
+	const transcript = buildReplyTranscript(
+		hello.sessionId,
+		helloSignPub,
+		helloDhPub,
+		replySignPub,
+		replyDhPub,
 	);
 
-	if (expectedServerSignPub && !bytesEqual(expectedServerSignPub, serverSignPub)) {
-		return { ok: false, serverSignPub, serverDhPub, transcript };
+	if (expectedSignPub && !bytesEqual(expectedSignPub, replySignPub)) {
+		return { ok: false, signPub: replySignPub, dhPub: replyDhPub, transcript };
 	}
-	const ok = verifySignature(transcript, signature, serverSignPub);
-	return { ok, serverSignPub, serverDhPub, transcript };
+	const ok = verifySignature(transcript, signature, replySignPub);
+	return { ok, signPub: replySignPub, dhPub: replyDhPub, transcript };
 }
 
 export function deriveSharedSecret(localDhPrivateKey: Uint8Array, remoteDhPublicKey: Uint8Array): Uint8Array {
 	return x25519.getSharedSecret(localDhPrivateKey, remoteDhPublicKey);
 }
 
-export function computeTranscriptHash(clientHello: ClientHello, serverHello: ServerHello): Uint8Array {
-	const clientSignPub = fromBase64Url(clientHello.clientSignPub);
-	const clientDhPub = fromBase64Url(clientHello.clientDhPub);
-	const serverSignPub = fromBase64Url(serverHello.serverSignPub);
-	const serverDhPub = fromBase64Url(serverHello.serverDhPub);
-	const transcript = buildServerHelloTranscript(
-		clientHello.sessionId,
-		clientSignPub,
-		clientDhPub,
-		serverSignPub,
-		serverDhPub,
+export function computeTranscriptHash(hello: Hello, reply: Reply): Uint8Array {
+	const helloSignPub = fromBase64Url(hello.signPub);
+	const helloDhPub = fromBase64Url(hello.dhPub);
+	const replySignPub = fromBase64Url(reply.signPub);
+	const replyDhPub = fromBase64Url(reply.dhPub);
+	const transcript = buildReplyTranscript(
+		hello.sessionId,
+		helloSignPub,
+		helloDhPub,
+		replySignPub,
+		replyDhPub,
 	);
 	return sha256(transcript);
 }
 
-export function deriveSessionKeys(sharedSecret: Uint8Array, transcriptHash: Uint8Array): SessionKeys {
-	const masterKey = hkdf(
-		sha256,
-		sharedSecret,
-		transcriptHash,
-		textToBytes("pi-queue-master"),
-		32,
-	);
-	const clientToServerKey = hkdf(
+export function deriveSessionKeys(sharedSecret: Uint8Array, transcriptHash: Uint8Array, role: Role): SessionKeys {
+	const masterKey = hkdf(sha256, sharedSecret, transcriptHash, textToBytes("cifra-master"), 32);
+	const initiatorToResponderKey = hkdf(
 		sha256,
 		masterKey,
 		transcriptHash,
-		textToBytes("pi-queue-c2s"),
+		textToBytes("cifra-i2r"),
 		32,
 	);
-	const serverToClientKey = hkdf(
+	const responderToInitiatorKey = hkdf(
 		sha256,
 		masterKey,
 		transcriptHash,
-		textToBytes("pi-queue-s2c"),
+		textToBytes("cifra-r2i"),
 		32,
 	);
-	return { clientToServerKey, serverToClientKey, transcriptHash };
+
+	if (role === "initiator") {
+		return { sendKey: initiatorToResponderKey, recvKey: responderToInitiatorKey, transcriptHash };
+	}
+	return { sendKey: responderToInitiatorKey, recvKey: initiatorToResponderKey, transcriptHash };
 }
 
 export function encryptPayload(
 	key: Uint8Array,
 	transcriptHash: Uint8Array,
-	direction: Direction,
 	index: number,
 	plaintext: Uint8Array,
 	aad?: Uint8Array,
 ): SecureEnvelope {
-	const nonce = deriveNonce(key, transcriptHash, direction, index);
+	const nonce = deriveNonce(key, transcriptHash, index);
 	const cipher = xchacha20poly1305(key, nonce, aad);
 	const ciphertext = cipher.encrypt(plaintext);
 	return {
@@ -217,12 +206,11 @@ export function encryptPayload(
 export function decryptPayload(
 	key: Uint8Array,
 	transcriptHash: Uint8Array,
-	direction: Direction,
 	index: number,
 	ciphertext: Uint8Array | string,
 	aad?: Uint8Array,
 ): Uint8Array {
-	const nonce = deriveNonce(key, transcriptHash, direction, index);
+	const nonce = deriveNonce(key, transcriptHash, index);
 	const cipher = xchacha20poly1305(key, nonce, aad);
 	const data = typeof ciphertext === "string" ? fromBase64Url(ciphertext) : ciphertext;
 	return cipher.decrypt(data);
@@ -247,48 +235,39 @@ export function fromBase64Url(value: string): Uint8Array {
 	return base64ToBytes(padded);
 }
 
-function buildClientHelloTranscript(
-	sessionId: string,
-	clientSignPub: Uint8Array,
-	clientDhPub: Uint8Array,
-): Uint8Array {
+function buildHelloTranscript(sessionId: string, signPub: Uint8Array, dhPub: Uint8Array): Uint8Array {
 	return encodeFrame(
 		textToBytes(PROTOCOL_ID),
-		textToBytes("client-hello"),
+		textToBytes("hello"),
 		textToBytes(sessionId),
-		clientSignPub,
-		clientDhPub,
+		signPub,
+		dhPub,
 	);
 }
 
-function buildServerHelloTranscript(
+function buildReplyTranscript(
 	sessionId: string,
-	clientSignPub: Uint8Array,
-	clientDhPub: Uint8Array,
-	serverSignPub: Uint8Array,
-	serverDhPub: Uint8Array,
+	helloSignPub: Uint8Array,
+	helloDhPub: Uint8Array,
+	replySignPub: Uint8Array,
+	replyDhPub: Uint8Array,
 ): Uint8Array {
 	return encodeFrame(
 		textToBytes(PROTOCOL_ID),
-		textToBytes("server-hello"),
+		textToBytes("reply"),
 		textToBytes(sessionId),
-		clientSignPub,
-		clientDhPub,
-		serverSignPub,
-		serverDhPub,
+		helloSignPub,
+		helloDhPub,
+		replySignPub,
+		replyDhPub,
 	);
 }
 
-function deriveNonce(
-	baseKey: Uint8Array,
-	transcriptHash: Uint8Array,
-	direction: Direction,
-	index: number,
-): Uint8Array {
+function deriveNonce(baseKey: Uint8Array, transcriptHash: Uint8Array, index: number): Uint8Array {
 	if (!Number.isInteger(index) || index < 0) {
 		throw new Error("nonce_index_invalid");
 	}
-	const info = textToBytes(`pi-queue-nonce:${direction}:${index}`);
+	const info = textToBytes(`cifra-nonce:${index}`);
 	return hkdf(sha256, baseKey, transcriptHash, info, 24);
 }
 

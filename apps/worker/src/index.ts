@@ -1,10 +1,9 @@
+import { computePiFractionDigits, computePiHashFromDigits } from "@queue/core";
 import {
 	buildSessionAad,
-	computePiFractionDigits,
-	computePiHashFromDigits,
 	computeTranscriptHash,
 	createDhKeyPair,
-	createServerHello,
+	createReply,
 	createSigningKeyPair,
 	decodeJson,
 	decryptPayload,
@@ -13,11 +12,11 @@ import {
 	encodeJson,
 	fromBase64Url,
 	toBase64Url,
-	verifyClientHello,
-	type ClientHello,
+	verifyHello,
+	type Hello,
+	type Reply,
 	type SecureEnvelope,
-	type ServerHello,
-} from "@queue/core";
+} from "@siguiente/cifra";
 
 const SESSION_DO_NAME = "singleton";
 const STATE_KEY = "state";
@@ -87,9 +86,9 @@ type ResponseMessage = {
 
 type HandshakeState = {
 	sessionId: string;
-	clientHello: ClientHello;
-	serverHello: ServerHello;
-	serverDhPriv: string;
+	hello: Hello;
+	reply: Reply;
+	responderDhPriv: string;
 	createdAt: number;
 };
 
@@ -236,23 +235,23 @@ function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
 }
 
-function asClientHello(value: unknown): ClientHello | null {
+function asHello(value: unknown): Hello | null {
 	if (!value || typeof value !== "object") {
 		return null;
 	}
 	const record = value as Record<string, unknown>;
 	if (
 		!isNonEmptyString(record.sessionId) ||
-		!isNonEmptyString(record.clientSignPub) ||
-		!isNonEmptyString(record.clientDhPub) ||
+		!isNonEmptyString(record.signPub) ||
+		!isNonEmptyString(record.dhPub) ||
 		!isNonEmptyString(record.signature)
 	) {
 		return null;
 	}
 	return {
 		sessionId: record.sessionId,
-		clientSignPub: record.clientSignPub,
-		clientDhPub: record.clientDhPub,
+		signPub: record.signPub,
+		dhPub: record.dhPub,
 		signature: record.signature,
 	};
 }
@@ -397,16 +396,16 @@ export class SessionDurableObject {
 		if (error) {
 			return jsonResponse({ error }, { status: 400 });
 		}
-		const clientHello = asClientHello(body);
-		if (!clientHello) {
-			return jsonResponse({ error: "invalid_client_hello" }, { status: 400 });
+		const hello = asHello(body);
+		if (!hello) {
+			return jsonResponse({ error: "invalid_hello" }, { status: 400 });
 		}
 
-		let verified: ReturnType<typeof verifyClientHello>;
+		let verified: ReturnType<typeof verifyHello>;
 		try {
-			verified = verifyClientHello(clientHello);
+			verified = verifyHello(hello);
 		} catch {
-			return jsonResponse({ error: "invalid_client_hello" }, { status: 400 });
+			return jsonResponse({ error: "invalid_hello" }, { status: 400 });
 		}
 		if (!verified.ok) {
 			return jsonResponse({ error: "invalid_signature" }, { status: 401 });
@@ -415,27 +414,27 @@ export class SessionDurableObject {
 		return this.state.blockConcurrencyWhile(async () => {
 			const now = Date.now();
 			const existing = await this.getHandshake();
-			if (existing && existing.sessionId === clientHello.sessionId && this.isHandshakeActive(existing, now)) {
+			if (existing && existing.sessionId === hello.sessionId && this.isHandshakeActive(existing, now)) {
 				const remaining = Math.max(HANDSHAKE_TIMEOUT_MS - (now - existing.createdAt), 0);
 				return jsonResponse(
-					{ serverHello: existing.serverHello, expiresInMs: remaining },
+					{ reply: existing.reply, expiresInMs: remaining },
 					{ status: 200 },
 				);
 			}
 
-			const serverSign = createSigningKeyPair();
-			const serverDh = createDhKeyPair();
-			const serverHello = createServerHello(clientHello, serverSign, serverDh);
+			const responderSign = createSigningKeyPair();
+			const responderDh = createDhKeyPair();
+			const reply = createReply(hello, responderSign, responderDh);
 			const handshake: HandshakeState = {
-				sessionId: clientHello.sessionId,
-				clientHello,
-				serverHello,
-				serverDhPriv: toBase64Url(serverDh.privateKey),
+				sessionId: hello.sessionId,
+				hello,
+				reply,
+				responderDhPriv: toBase64Url(responderDh.privateKey),
 				createdAt: now,
 			};
 			await this.saveHandshake(handshake);
 
-			return jsonResponse({ serverHello, expiresInMs: HANDSHAKE_TIMEOUT_MS }, { status: 200 });
+			return jsonResponse({ reply, expiresInMs: HANDSHAKE_TIMEOUT_MS }, { status: 200 });
 		});
 	}
 
@@ -467,11 +466,11 @@ export class SessionDurableObject {
 
 			let keys: ReturnType<typeof deriveSessionKeys>;
 			try {
-				const serverDhPriv = fromBase64Url(handshake.serverDhPriv);
-				const clientDhPub = fromBase64Url(handshake.clientHello.clientDhPub);
-				const sharedSecret = deriveSharedSecret(serverDhPriv, clientDhPub);
-				const transcriptHash = computeTranscriptHash(handshake.clientHello, handshake.serverHello);
-				keys = deriveSessionKeys(sharedSecret, transcriptHash);
+				const responderDhPriv = fromBase64Url(handshake.responderDhPriv);
+				const initiatorDhPub = fromBase64Url(handshake.hello.dhPub);
+				const sharedSecret = deriveSharedSecret(responderDhPriv, initiatorDhPub);
+				const transcriptHash = computeTranscriptHash(handshake.hello, handshake.reply);
+				keys = deriveSessionKeys(sharedSecret, transcriptHash, "responder");
 			} catch {
 				await this.clearHandshake();
 				return jsonResponse({ error: "handshake_invalid" }, { status: 400 });
@@ -481,9 +480,8 @@ export class SessionDurableObject {
 			let decrypted: unknown;
 			try {
 				const plaintext = decryptPayload(
-					keys.clientToServerKey,
+					keys.recvKey,
 					keys.transcriptHash,
-					"c2s",
 					envelope.index,
 					envelope.ciphertext,
 					aad,
@@ -527,9 +525,8 @@ export class SessionDurableObject {
 
 			const responseIndex = envelope.index + 1;
 			const responseEnvelope = encryptPayload(
-				keys.serverToClientKey,
+				keys.sendKey,
 				keys.transcriptHash,
-				"s2c",
 				responseIndex,
 				encodeJson(responsePayload),
 				aad,
